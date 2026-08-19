@@ -1,0 +1,10 @@
+.env
+nohup.out
+clips
+dataset
+snapshots
+__pycache__
+*.jpg
+*.pt
+*.onnx
+.venv

@@ -20,6 +20,10 @@ import re
 import math
 import time
 import threading
+import socket
+import socketserver
+import http.server
+import subprocess
 from collections import deque
 from pathlib import Path
 import requests
@@ -33,6 +37,7 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
 import cv2
 import numpy as np
 import onnxruntime as ort
+from soco import SoCo
 
 from dotenv import dotenv_values
 from webview import WebView
@@ -46,17 +51,19 @@ config = dotenv_values(".env")
 _BASE = os.environ.get("CATCAM_URL", "rtsp://camera:PASSWORD@192.168.5.207/")
 _STREAM = os.environ.get("CATCAM_STREAM", "stream1")
 RTSP_URL = _BASE.rstrip("/") + "/" + _STREAM
-MODEL_PATH = os.environ.get("CATCAM_MODEL", "yolo11s.onnx")
+MODEL_PATH = os.environ.get("CATCAM_MODEL", "best.onnx")
 IMGSZ = int(os.environ.get("CATCAM_IMGSZ", 640))
 
-BOOL_PROJECT_URL = "https://cat-detector.bool.so"
-BOOL_API_KEY = config["API_KEY"]
+AUDIO_FILE = "deterrent.wav" # File must be in the same folder as this script
+SONOS_IP = "192.168.5.183"    # Replace with your actual Sonos IP address
+AUDIO_PORT = 8000
+AUDIO_VOLUME = 80              # Deterrent volume level (0-100)
+AUDIO_DURATION = 4.5           # Length of your audio file in seconds
 
 # ---- Dataset capture -------------------------------------------------------
 DATASET_DIR = Path("dataset")
 CAPTURE_ENABLED = True
 
-# Save a frame at most this often, so you don't get 500 near-identical images.
 CAPTURE_MIN_INTERVAL = 4.0
 CAPTURE_NEGATIVE_EVERY = 90.0
 CAPTURE_LABEL_THRESH = 0.15
@@ -71,12 +78,12 @@ CLIP_FPS = 6.0              # playback rate written into the file
 CLIP_SCALE = 0.5            # 1.0 = full res. 0.5 on 1080p is plenty for triage
 CLIP_OVERLAY = True         # record the annotated view, not the raw frame
 
-# Class ids in YOUR dataset (not COCO). Keep this list stable once you start.
+# Class ids in YOUR dataset
 DATASET_CLASSES = ["cat", "dog", "person"]
-COCO_TO_DATASET = {15: 0, 16: 1, 0: 2, 21: 0, 77: 0}
+COCO_TO_DATASET = {0: 0, 1: 1, 2: 2}
 
-CONF_THRESH = 0.30
-IOU_THRESH = 0.45
+CONF_THRESH = 0.50
+IOU_THRESH = 0.60
 INFER_FPS = 5.0
 
 # How the frame is cropped before inference.
@@ -84,13 +91,10 @@ INFER_FPS = 5.0
 #              counter is inspected at its own scale regardless of distance.
 #   "fixed"  - single crop from ROI_FIXED below.
 #   "none"   - whole frame (worst detail on a wide-angle camera).
-ROI_MODE = "zones"
+ROI_MODE = "fixed"
+ROI_FIXED = (0.20, 0.22, 0.78, 1.00)
 
-ROI_FIXED: tuple[float, float, float, float] | None = None
-
-# Padding around each zone's bounding box, as a fraction of its size.
-# Top gets much more: a cat standing on a counter has its feet (the anchor
-# point) on the surface but its body extending well above the polygon.
+# Padding around each zone's bounding box, as a fraction of its size..
 ROI_PAD_TOP = 1.20
 ROI_PAD_SIDE = 0.15
 ROI_PAD_BOTTOM = 0.15
@@ -99,23 +103,22 @@ ROI_PAD_BOTTOM = 0.15
 # upscales blur, so don't go below this.
 ROI_MIN_EDGE = 320
 
-# With several zones, inferring on all of them every cycle multiplies cost.
 #   True  - every zone every cycle (INFER_FPS applies per full sweep)
 #   False - one zone per cycle, round-robin (each zone gets INFER_FPS / n)
 ROI_ALL_EACH_CYCLE = False
 
 # COCO class ids we care about.
-CLASS_NAMES = {0: "person", 15: "cat", 16: "dog", 21: "bear", 77: "teddy bear"}
-ANIMAL_CLASSES = [15, 16, 21, 77]
+CLASS_NAMES = {0: "cat", 1: "dog", 2: "person"}
+ANIMAL_CLASSES = [0, 1]
 
-TARGET_CLASSES = set(ANIMAL_CLASSES)
-DRAW_CLASSES = {0, 15, 16, 21, 77}
+TARGET_CLASSES = {0}
+DRAW_CLASSES = {0, 1, 2}
 
 # Temporal filter: need N detections within the last M inference frames.
 HISTORY_LEN = 5
 HISTORY_HITS = 3
 
-ALERT_COOLDOWN = 30.0          # seconds between alerts
+ALERT_COOLDOWN = 30.0
 SNAPSHOT_DIR = Path("snapshots")
 
 # Active zones - a cat's anchor point inside ANY of these triggers.
@@ -124,9 +127,10 @@ SNAPSHOT_DIR = Path("snapshots")
 # Build these interactively: click the outline, press 'n' to name and store,
 # repeat for the next counter, then press 'z' to print the whole block.
 ZONES = {
-    "island": [(826, 776),(1615, 821),(1379, 1149),(578, 954)],
-    "counter-lg": [(980, 576),(1916, 484),(1928, 600),(864, 652)],
-    "counter-sm": [(884, 576),(984, 568),(656, 768),(628, 720)],
+    "island": [(818, 780),(1630, 809),(1374, 1161),(561, 972)],
+    # "counter": [(887, 571),(1919, 480),(1950, 756),(629, 718)],
+    "counter-lg": [(894, 564),(1920, 475),(1937, 622),(693, 676)],
+    "counter-sm": [(625, 715),(695, 672),(904, 666),(672, 815)]
 }
 
 SHOW_WINDOW = False
@@ -136,60 +140,24 @@ WEB_QUALITY = 50
 # Intra-op threads. Cap this - oversubscription hurts on a 4-core box.
 ORT_THREADS = 4
 
-def upload_clip_to_bool(filepath: Path, zone: str, started: float, frames_len: int, fps: float):
-    """Upload the saved MP4 file to bool.so storage and write a row to the table."""
-    if not BOOL_API_KEY:
-        print("[upload] skipped - BOOL_API_KEY not set in .env")
-        return
-
-    file_name = filepath.name
-    storage_path = f"clips/{file_name}"
-
-    # 1. Upload to file storage
-    # NOTE: The provided docs cover the DB. This storage URL assumes a standard REST pattern.
-    # If bool.so has a specific REST endpoint for storage uploads, it would go here.
-    storage_url = f"{BOOL_PROJECT_URL}/_bool/v1/storage/buckets/default/objects/{storage_path}"
-    
-    storage_headers = {
-        "api_key": BOOL_API_KEY,
-        "Content-Type": "video/mp4"
-    }
-    
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        with open(filepath, "rb") as f:
-            print(f"[upload] Uploading {file_name} to bool.so storage...")
-            storage_resp = requests.post(storage_url, headers=storage_headers, data=f)
-            storage_resp.raise_for_status()
-    except Exception as e:
-        print(f"[upload] Storage upload failed: {e}")
-        return
+        s.connect(('10.255.255.255', 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = '127.0.0.1'
+    finally:
+        s.close()
+    return ip
 
-    # 2. Insert record into bool.entities.clips table
-    # Updated to match the documentation exactly
-    table_url = f"{BOOL_PROJECT_URL}/_bool/v1/db/rest/v1/clips"
-    
-    db_headers = {
-        "api_key": BOOL_API_KEY,
-        "Content-Type": "application/json"
-    }
-    
-    payload = {
-        "file_name": file_name,
-        "storage_path": storage_path,
-        "event_at": datetime.fromtimestamp(started, tz=timezone.utc).isoformat(),
-        "duration_seconds": round(frames_len / fps, 2),
-        "notes": f"Auto-captured detection in zone: {zone}",
-        "uploaded_by": "catcam"
-    }
-
-    try:
-        db_resp = requests.post(table_url, headers=db_headers, json=payload)
-        db_resp.raise_for_status()
-        print(f"[upload] Successfully inserted row into bool.entities.clips")
-    except Exception as e:
-        print(f"[upload] DB insert failed: {e}")
-        if hasattr(e, 'response') and e.response is not None:
-             print(f"[upload] Server returned: {e.response.text}")
+def start_audio_server(port):
+    handler = http.server.SimpleHTTPRequestHandler
+    socketserver.TCPServer.allow_reuse_address = True
+    httpd = socketserver.TCPServer(("", port), handler)
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    return httpd
 
 # ----------------------------------------------------------------------------
 # Model
@@ -276,7 +244,14 @@ class Detector:
 
         # Merge the animal classes into one score, so a cat split between
         # "cat" and "dog" isn't thresholded out of existence.
-        animal_conf = scores_all[ANIMAL_CLASSES].max(axis=0)
+        valid_animals = [c for c in ANIMAL_CLASSES if c < self.num_classes]
+        
+        if valid_animals:
+            animal_conf = scores_all[valid_animals].max(axis=0)
+        else:
+            # Fallback if the model has no animal classes mapped
+            animal_conf = np.zeros(scores_all.shape[1], dtype=np.float32)
+
         conf_all = np.maximum(animal_conf, scores_all.max(axis=0))
 
         keep = conf_all > CONF_THRESH
@@ -554,7 +529,9 @@ class DatasetCapture:
         now = time.time()
         labeled = [
             d for d in detections
-            if d[1] >= CAPTURE_LABEL_THRESH and d[0] in COCO_TO_DATASET
+            if d[1] >= CAPTURE_LABEL_THRESH 
+            and d[0] in COCO_TO_DATASET
+            and COCO_TO_DATASET[d[0]] < len(self.classes)
         ]
 
         if not force:
@@ -680,15 +657,12 @@ class ClipRecorder:
         print(f"[clip] saved {path} ({len(frames)} frames, {secs:.1f}s"
               + (", hit max length)" if truncated else ")"))
         
-        upload_clip_to_bool(path, zone, started, len(frames), CLIP_FPS)
-
 # ----------------------------------------------------------------------------
 # Alerting
 # ----------------------------------------------------------------------------
 
 
-def fire_alert(frame, detections, zone_name):
-    """Replace with the Sonos call. Runs on its own thread - keep it off the hot path."""
+def fire_alert(frame, detections, zone_name, audio_uri=None):
     names = ", ".join(
         f"{CLASS_NAMES.get(c, c)} {p:.2f} (animal {a:.2f})"
         for c, p, _, a in detections
@@ -700,15 +674,24 @@ def fire_alert(frame, detections, zone_name):
     cv2.imwrite(str(path), frame)
     print(f"[ALERT] saved {path}")
 
-    # from soco import SoCo
-    # SoCo("192.168.5.50").play_uri("http://.../get_off.mp3")
+    if audio_uri:
+        try:
+            print(f"[ALERT] Triggering Sonos at {SONOS_IP}...")
+            sonos = SoCo(SONOS_IP)
+            original_volume = sonos.volume
+            sonos.volume = AUDIO_VOLUME
+            sonos.play_uri(audio_uri)
+            time.sleep(AUDIO_DURATION)
+            sonos.volume = original_volume
+        except Exception as e:
+            print(f"[ALERT] Error communicating with Sonos: {e}")
 
 
 # ----------------------------------------------------------------------------
 # Debug overlay
 # ----------------------------------------------------------------------------
 
-COLORS = {0: (200, 200, 200), 15: (60, 200, 255), 16: (255, 160, 60)}
+COLORS = {0: (60, 200, 255), 1: (255, 160, 60), 2: (200, 200, 200)}
 clicked_points: list[tuple[int, int]] = []
 
 
@@ -816,6 +799,12 @@ def main():
 
     print(f"[init] url: {_mask_url(RTSP_URL)}")
     cam = FreshestFrame(RTSP_URL)
+    
+    local_ip = get_local_ip()
+    print(f"[init] Starting audio server on {local_ip}:{AUDIO_PORT}")
+    audio_server = start_audio_server(AUDIO_PORT)
+    audio_uri = f"http://{local_ip}:{AUDIO_PORT}/{AUDIO_FILE}"
+    print(f"[init] Sonos deterrent URI configured as: {audio_uri}")
 
     while cam.read() is None:
         time.sleep(0.2)
@@ -880,25 +869,42 @@ def main():
 
                 if ROI_MODE == "zones":
                     rois = zone_rois(ZONES, frame.shape)
+                    current_roi_count = len(rois) if not ROI_ALL_EACH_CYCLE else 1
+                    
                     if ROI_ALL_EACH_CYCLE or len(rois) == 1:
                         active = rois
                     else:
                         active = [rois[rr_index % len(rois)]]
                         rr_index += 1
+                        
                     dets = merge_detections([det(frame, r) for _, r in active])
                     last_rois = [r for _, r in active]
+                    
                 elif ROI_MODE == "fixed":
+                    current_roi_count = 1
                     dets = det(frame, ROI_FIXED)
                     last_rois = [ROI_FIXED]
+                    
                 else:
+                    current_roi_count = 1
                     dets = det(frame, None)
                     last_rois = [None]
 
                 infer_ms = (time.time() - t0) * 1000
 
+                dynamic_history_len = HISTORY_LEN * current_roi_count
+                if history.maxlen != dynamic_history_len:
+                    history = deque(history, maxlen=dynamic_history_len)
+                    
+                # person_zones = set()
                 zone_hits = []
                 hit_zone = None
+                person_detected = False
+                
                 for d in dets:
+                    if d[0] == 2:
+                        person_detected = True
+                        
                     if d[0] not in TARGET_CLASSES:
                         continue
                     z = which_zone(anchor_point(d[2]), ZONES)
@@ -906,9 +912,13 @@ def main():
                         zone_hits.append(d)
                         hit_zone = hit_zone or z
 
+                if person_detected:
+                    zone_hits = []
+                    hit_zone = None
+                
                 history.append(bool(zone_hits))
                 streak = sum(history)
-
+                
                 if capture is not None:
                     latest_for_capture["frame"] = frame
                     latest_for_capture["dets"] = dets
@@ -923,7 +933,12 @@ def main():
                     last_alert[hit_zone] = now
                     threading.Thread(
                         target=fire_alert,
-                        args=(frame.copy(), list(zone_hits), hit_zone),
+                        args=(
+                            frame.copy(), 
+                            list(zone_hits), 
+                            hit_zone, 
+                            # audio_uri
+                        ),
                         daemon=True,
                     ).start()
                     history.clear()

@@ -51,7 +51,7 @@ PAGE = """<!doctype html>
  .empty{color:#73726c;padding:8px 0}
 </style></head><body>
 <div id="wrap">
-  <img id="vid" src="/stream">
+  <img id="vid" src="">
   <canvas id="cv"></canvas>
 </div>
 <div id="bar">
@@ -78,18 +78,42 @@ PAGE = """<!doctype html>
 <div id="dets"></div>
 <div id="zones"></div>
 <script>
+document.getElementById('vid').src = "/stream?t=" + Date.now();
 const img=document.getElementById('vid'),cv=document.getElementById('cv'),
       ctx=cv.getContext('2d');
 let pts=[],nat=[640,360];
 
 function fit(){cv.width=img.clientWidth;cv.height=img.clientHeight;
   if(img.naturalWidth)nat=[img.naturalWidth,img.naturalHeight];draw();}
-img.onload=fit;addEventListener('resize',fit);
+img.onload = () => setTimeout(fit, 100);
+addEventListener('resize', fit);
 
 cv.onclick=e=>{const r=cv.getBoundingClientRect();
   const x=Math.round((e.clientX-r.left)/r.width*nat[0]);
   const y=Math.round((e.clientY-r.top)/r.height*nat[1]);
   pts.push([x,y]);draw();};
+
+async function cap(tag) {
+  try {
+    const r = await fetch('/capture', {
+      method: 'POST',
+      body: JSON.stringify({ tag: tag })
+    });
+    const res = await r.json();
+    const msgEl = document.getElementById('capmsg');
+    
+    if (res.ok) {
+      msgEl.textContent = 'Saved: ' + res.name;
+    } else {
+      msgEl.textContent = 'Failed (is on_capture set?)';
+    }
+    
+    // Clear the message after 3 seconds
+    setTimeout(() => { msgEl.textContent = ''; }, 3000);
+  } catch(e) {
+    document.getElementById('capmsg').textContent = 'Error during capture';
+  }
+}
 
 function draw(){ctx.clearRect(0,0,cv.width,cv.height);
   if(!pts.length)return;
@@ -108,44 +132,49 @@ async function save(){const n=document.getElementById('name').value.trim();
   await fetch('/zone',{method:'POST',body:JSON.stringify({name:n,points:pts})});
   pts=[];document.getElementById('name').value='';draw();refresh();}
 async function delLast(){await fetch('/zone/dellast',{method:'POST'});refresh();}
-async function refresh(){const r=await fetch('/zones');const z=await r.json();
-  document.getElementById('zones').textContent=
-    'ZONES = {\\n'+Object.entries(z).map(([k,v])=>
-      '    '+JSON.stringify(k)+': '+JSON.stringify(v).replace(/\\[(\\d+),(\\d+)\\]/g,'($1, $2)')+',')
-      .join('\\n')+'\\n}';}
-function dump(){refresh();}
-async function cap(tag){
-  const r=await(await fetch('/capture',{method:'POST',
-    body:JSON.stringify({tag:tag})})).json();
-  const m=document.getElementById('capmsg');
-  m.textContent=r.ok?('saved '+r.name):'capture failed';
-  setTimeout(()=>m.textContent='',2500);
+async function refresh(){
+  try {
+    const r=await fetch('/zones');
+    const z=await r.json();
+    document.getElementById('zones').textContent=
+      'ZONES = {\\n'+Object.entries(z).map(([k,v])=>
+        '    '+JSON.stringify(k)+': '+JSON.stringify(v).replace(/\\[(\\d+),(\\d+)\\]/g,'($1, $2)')+',')
+        .join('\\n')+'\\n}';
+  } catch(e) {}
+  setTimeout(refresh, 5000); // Wait 5s AFTER completion
 }
-refresh();setInterval(refresh,5000);
+refresh();
 
 function bar(v){const w=Math.round(v*90);
   return '<span class="bar'+(v<0.3?' lo':'')+'" style="width:'+Math.max(w,2)+'px"></span> '+v.toFixed(2);}
 
 async function status(){
-  let s;try{s=await(await fetch('/status')).json()}catch(e){return}
-  if(!s||s.infer_ms===undefined)return;
-  document.getElementById('ms').textContent=s.infer_ms;
-  document.getElementById('streak').textContent=s.streak+'/'+s.need;
-  document.getElementById('th').textContent=(s.conf_thresh||0).toFixed(2);
-  document.getElementById('trig').textContent=s.triggered?'TRIGGERED':'idle';
-  document.getElementById('lamp').className='lamp'+(s.triggered?' on':'');
-  const d=s.detections||[];
-  const el=document.getElementById('dets');
-  if(!d.length){el.innerHTML='<div class="empty">no detections above threshold</div>';return;}
-  el.innerHTML='<table><tr><th>class</th><th>class conf</th><th>animal score</th>'
-    +'<th>zone</th><th>box</th></tr>'
-    +d.map(r=>'<tr><td>'+r.cls+'</td><td>'+bar(r.conf)+'</td><td>'
-      +(r.target?bar(r.animal):'<span style="color:#5f5e5a">-</span>')+'</td><td>'
-      +(r.zone?'<span class="tag hit">'+r.zone+'</span>'
-             :'<span class="tag miss">outside</span>')+'</td><td style="color:#73726c">'
-      +r.box.join(', ')+'</td></tr>').join('')+'</table>';
+  try {
+    let r=await fetch('/status');
+    let s=await r.json();
+    if(s && s.infer_ms!==undefined) {
+      document.getElementById('ms').textContent=s.infer_ms;
+      document.getElementById('streak').textContent=s.streak+'/'+s.need;
+      document.getElementById('th').textContent=(s.conf_thresh||0).toFixed(2);
+      document.getElementById('trig').textContent=s.triggered?'TRIGGERED':'idle';
+      document.getElementById('lamp').className='lamp'+(s.triggered?' on':'');
+      const d=s.detections||[];
+      const el=document.getElementById('dets');
+      if(!d.length){el.innerHTML='<div class="empty">no detections above threshold</div>';}
+      else {
+        el.innerHTML='<table><tr><th>class</th><th>class conf</th><th>animal score</th>'
+          +'<th>zone</th><th>box</th></tr>'
+          +d.map(r=>'<tr><td>'+r.cls+'</td><td>'+bar(r.conf)+'</td><td>'
+            +(r.target?bar(r.animal):'<span style="color:#5f5e5a">-</span>')+'</td><td>'
+            +(r.zone?'<span class="tag hit">'+r.zone+'</span>'
+                   :'<span class="tag miss">outside</span>')+'</td><td style="color:#73726c">'
+            +r.box.join(', ')+'</td></tr>').join('')+'</table>';
+      }
+    }
+  } catch(e) {}
+  setTimeout(status, 300); // Wait 300ms AFTER completion
 }
-setInterval(status,300);status();
+status();
 </script></body></html>"""
 
 
@@ -207,7 +236,7 @@ class WebView:
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
-            timeout = 5.0  # <--- CRITICAL FIX: Drops dead sockets automatically
+            timeout = 5.0
 
             def log_message(self, *a):
                 pass
@@ -227,11 +256,15 @@ class WebView:
             def _send(self, code, body, ctype="application/json"):
                 if isinstance(body, str):
                     body = body.encode()
-                self.send_response(code)
-                self.send_header("Content-Type", ctype)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.send_response(code)
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                except (OSError, TimeoutError):
+                    self.close_connection = True
 
             def do_GET(self):
                 path = urlparse(self.path).path
@@ -257,14 +290,16 @@ class WebView:
                     self._send(404, "{}")
 
             def _stream(self):
-                self.send_response(200)
-                self.send_header("Age", "0")
-                self.send_header("Cache-Control", "no-cache, private")
-                self.send_header(
-                    "Content-Type", f"multipart/x-mixed-replace; boundary={BOUNDARY}")
-                self.end_headers()
-                seq = -1
                 try:
+                    self.send_response(200)
+                    self.send_header("Age", "0")
+                    self.send_header("Cache-Control", "no-cache, private")
+                    self.send_header("Pragma", "no-cache")
+                    self.send_header("Connection", "close")
+                    self.send_header(
+                        "Content-Type", f"multipart/x-mixed-replace; boundary={BOUNDARY}")
+                    self.end_headers()
+                    seq = -1
                     while True:
                         jpg, seq = outer._wait_frame(seq)
                         if jpg is None:
@@ -275,9 +310,13 @@ class WebView:
                             f"Content-Length: {len(jpg)}\r\n\r\n".encode())
                         self.wfile.write(jpg)
                         self.wfile.write(b"\r\n")
+                        self.wfile.flush()  # <--- forces data to network, instantly raises error if client is gone
                 except (OSError, TimeoutError):
-                    # Fails cleanly if the TCP window is full or client disconnected
+                    # Client dropped the connection
                     pass
+                finally:
+                    # Guarantee the thread dies and frees up the socket
+                    self.close_connection = True
 
             def do_POST(self):
                 path = urlparse(self.path).path

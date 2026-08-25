@@ -710,11 +710,15 @@ def main():
     print(f"[init] url: {_mask_url(cfg["rtsp_url"])}")
     cam = FreshestFrame(cfg["rtsp_url"])
     
-    local_ip = get_local_ip()
-    print(f"[init] Starting audio server on {local_ip}:{cfg["audio"]["port"]}")
-    audio_server = start_audio_server(cfg["audio"]["port"])
-    audio_uri = f"http://{local_ip}:{cfg["audio"]["port"]}/{cfg["audio"]["file"]}"
-    print(f"[init] Sonos deterrent URI configured as: {audio_uri}")
+    audio_uri = None
+    if cfg["audio"]["enabled"]:
+        local_ip = get_local_ip()
+        print(f"[init] Starting audio server on {local_ip}:{cfg["audio"]["port"]}")
+        start_audio_server(cfg["audio"]["port"])
+        audio_uri = f"http://{local_ip}:{cfg["audio"]["port"]}/{cfg["audio"]["file"]}"
+        print(f"[init] Sonos deterrent URI configured as: {audio_uri}")
+    else:
+        print("[init] Sonos deterrent disabled")
 
     while cam.read() is None:
         time.sleep(0.2)
@@ -844,10 +848,10 @@ def main():
                     threading.Thread(
                         target=fire_alert,
                         args=(
-                            frame.copy(), 
-                            list(zone_hits), 
-                            hit_zone, 
-                            # audio_uri
+                            frame.copy(),
+                            list(zone_hits),
+                            hit_zone,
+                            audio_uri,
                         ),
                         daemon=True,
                     ).start()

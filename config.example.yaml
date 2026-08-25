@@ -6,15 +6,16 @@
 rtsp_url: rtsp://user:password@192.168.1.100/stream1
 
 model:
-  path: best.onnx
+  path: yolo11s.onnx
   imgsz: 640
   # Intra-op threads
   ort_threads: 4
-  conf_thresh: 0.50
-  iou_thresh: 0.60
+  conf_thresh: 0.35
+  iou_thresh: 0.50
   infer_fps: 5.0
 
 audio:
+  enabled: false          # play deterrent on Sonos when a cat is in-zone
   # File must be in the same folder as the script
   file: deterrent.wav
   sonos_ip: 192.168.1.50

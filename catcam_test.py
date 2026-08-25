@@ -12,7 +12,7 @@ Keys (in debug window):
   space   : pause/unpause
 
 Workflow: click the outline of one counter, press 'n', type a name.
-Repeat for the next counter. Press 'z' and paste the output into ZONES.
+Repeat for the next counter. Press 'z' and paste the output into config.yaml.
 """
 
 import os
@@ -20,6 +20,7 @@ import time
 import threading
 from collections import deque
 from pathlib import Path
+import yaml
 
 # Must be set before cv2 import touches the FFMPEG backend.
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
@@ -32,60 +33,13 @@ import onnxruntime as ort
 
 from webview import WebView
 
-# ----------------------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------------------
-
-RTSP_URL = os.environ.get(
-    "CATCAM_URL"
-) + "stream1"
-
-MODEL_PATH = os.environ.get("CATCAM_MODEL", "yolo11n.onnx")
-IMGSZ = int(os.environ.get("CATCAM_IMGSZ", 640))
-
-CONF_THRESH = 0.30
-IOU_THRESH = 0.45
-INFER_FPS = 5.0
-
-# Region of interest, as fractions of the full frame: (x1, y1, x2, y2).
-# Cropping to just the counters before inference is the single biggest win for
-# distant cats - the animal fills far more of the model's input.
-# None = use the whole frame.
-ROI: tuple[float, float, float, float] | None = None
-
-# COCO class ids we care about.
-CLASS_NAMES = {0: "person", 15: "cat", 16: "dog", 21: "bear", 77: "teddy bear"}
-
-# Classes merged into one "animal" decision. A cat split 0.28 cat / 0.26 dog
-# fails both thresholds separately but passes comfortably when merged.
-ANIMAL_CLASSES = [15, 16, 21, 77]
-
-TARGET_CLASSES = set(ANIMAL_CLASSES)     # what triggers an alert
-DRAW_CLASSES = {0, 15, 16, 21, 77}       # what gets drawn in the debug view
-
-# Temporal filter: need N detections within the last M inference frames.
-HISTORY_LEN = 5
-HISTORY_HITS = 3
-
-ALERT_COOLDOWN = 30.0          # seconds between alerts
-SNAPSHOT_DIR = Path("snapshots")
-
-# Active zones - a cat's anchor point inside ANY of these triggers.
-# Points are (x, y) in ORIGINAL frame coordinates, not letterboxed.
-# Empty list = whole frame active.
-# Build these interactively: click the outline, press 'n' to name and store,
-# repeat for the next counter, then press 'z' to print the whole block.
-ZONES: dict[str, list[tuple[int, int]]] = {
-    # "main_counter": [(120, 210), (300, 205), (310, 300), (110, 305)],
-    # "island":       [(380, 190), (560, 195), (570, 280), (375, 275)],
-}
-
-SHOW_WINDOW = False        # local cv2 window; needs a display on the mini
-WEB_PORT = 8080            # set to None to disable the MJPEG server
-WEB_QUALITY = 70           # JPEG quality; lower = less bandwidth
-
-# Intra-op threads. Cap this - oversubscription hurts on a 4-core box.
-ORT_THREADS = 4
+_cfg_path = Path(__file__).with_name("config.yaml")
+if not _cfg_path.exists():
+    _cfg_path.write_text(Path(__file__).with_name("config.example.yaml").read_text())
+    print("[init] created config.yaml from config.example.yaml")
+cfg = yaml.safe_load(_cfg_path.read_text())
+cfg.setdefault("zones", {})
+roi = cfg["roi"]["fixed"] if cfg["roi"]["mode"] == "fixed" else None
 
 # ----------------------------------------------------------------------------
 # Model
@@ -95,7 +49,7 @@ ORT_THREADS = 4
 class Detector:
     def __init__(self, model_path: str, imgsz: int = 640):
         so = ort.SessionOptions()
-        so.intra_op_num_threads = ORT_THREADS
+        so.intra_op_num_threads = cfg["model"]["ort_threads"]
         so.inter_op_num_threads = 1
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
@@ -168,14 +122,14 @@ class Detector:
             # (300, 6) = [x1, y1, x2, y2, conf, class], already NMS'd and sorted.
             # No per-class score vector survives, so the animal score is just
             # the confidence when the predicted class is an animal.
-            keep = out[:, 4] > CONF_THRESH
+            keep = out[:, 4] > cfg["model"]["conf_thresh"]
             if not keep.any():
                 return []
             sel = out[keep]
             lx1, ly1, lx2, ly2 = sel[:, 0], sel[:, 1], sel[:, 2], sel[:, 3]
             conf = sel[:, 4]
             cls = sel[:, 5].astype(int)
-            acon = np.where(np.isin(cls, ANIMAL_CLASSES), conf, 0.0)
+            acon = np.where(np.isin(cls, cfg["classes"]["animal"]), conf, 0.0)
             do_nms = False
         else:
             # (84, 8400) = 4 box coords + 80 class scores per grid cell.
@@ -183,10 +137,10 @@ class Detector:
 
             # Merge the animal classes into one score, so a cat split between
             # "cat" and "dog" isn't thresholded out of existence.
-            animal_conf = scores_all[ANIMAL_CLASSES].max(axis=0)
+            animal_conf = scores_all[cfg["classes"]["animal"]].max(axis=0)
             conf_all = np.maximum(animal_conf, scores_all.max(axis=0))
 
-            keep = conf_all > CONF_THRESH
+            keep = conf_all > cfg["model"]["conf_thresh"]
             if not keep.any():
                 return []
 
@@ -207,7 +161,7 @@ class Detector:
         if do_nms:
             rects = np.stack([x1, y1, x2 - x1, y2 - y1], axis=1)
             idxs = cv2.dnn.NMSBoxes(
-                rects.tolist(), conf.tolist(), CONF_THRESH, IOU_THRESH
+                rects.tolist(), conf.tolist(), cfg["model"]["conf_thresh"], cfg["model"]["iou_thresh"]
             )
             if len(idxs) == 0:
                 return []
@@ -321,13 +275,13 @@ def which_zone(point, zones) -> str | None:
 def fire_alert(frame, detections, zone_name):
     """Replace with the Sonos call. Runs on its own thread - keep it off the hot path."""
     names = ", ".join(
-        f"{CLASS_NAMES.get(c, c)} {p:.2f} (animal {a:.2f})"
+        f"{cfg["classes"]["names"].get(c, c)} {p:.2f} (animal {a:.2f})"
         for c, p, _, a in detections
     )
     print(f"[ALERT] {time.strftime('%H:%M:%S')} - {names} in '{zone_name}'")
 
-    SNAPSHOT_DIR.mkdir(exist_ok=True)
-    path = SNAPSHOT_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{zone_name}.jpg"
+    Path(cfg["alert"]["snapshot_dir"]).mkdir(exist_ok=True)
+    path = Path(cfg["alert"]["snapshot_dir"]) / f"{time.strftime('%Y%m%d-%H%M%S')}-{zone_name}.jpg"
     cv2.imwrite(str(path), frame)
     print(f"[ALERT] saved {path}")
 
@@ -355,10 +309,10 @@ ZONE_COLORS = [(0, 0, 220), (220, 0, 180), (0, 180, 220), (180, 120, 0)]
 def draw_overlay(frame, detections, infer_ms, armed_streak, triggered):
     out = frame.copy()
 
-    if ROI:
+    if roi:
         h, w = out.shape[:2]
-        rx1, ry1 = int(ROI[0] * w), int(ROI[1] * h)
-        rx2, ry2 = int(ROI[2] * w), int(ROI[3] * h)
+        rx1, ry1 = int(roi[0] * w), int(roi[1] * h)
+        rx2, ry2 = int(roi[2] * w), int(roi[3] * h)
         dark = out.copy()
         cv2.rectangle(dark, (0, 0), (w, h), (0, 0, 0), -1)
         cv2.rectangle(dark, (rx1, ry1), (rx2, ry2), (255, 255, 255), -1)
@@ -368,16 +322,16 @@ def draw_overlay(frame, detections, infer_ms, armed_streak, triggered):
         cv2.putText(out, f"ROI {rx2-rx1}x{ry2-ry1}", (rx1 + 3, ry1 + 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
-    if ZONES:
+    if cfg["zones"]:
         shade = out.copy()
-        for i, (name, poly_pts) in enumerate(ZONES.items()):
+        for i, (name, poly_pts) in enumerate(cfg["zones"].items()):
             if len(poly_pts) < 3:
                 continue
             poly = np.array(poly_pts, dtype=np.int32)
             cv2.fillPoly(shade, [poly], ZONE_COLORS[i % len(ZONE_COLORS)])
         cv2.addWeighted(shade, 0.22, out, 0.78, 0, out)
 
-        for i, (name, poly_pts) in enumerate(ZONES.items()):
+        for i, (name, poly_pts) in enumerate(cfg["zones"].items()):
             if len(poly_pts) < 3:
                 continue
             poly = np.array(poly_pts, dtype=np.int32)
@@ -397,17 +351,17 @@ def draw_overlay(frame, detections, infer_ms, armed_streak, triggered):
                           False, (255, 0, 255), 1)
 
     for cls, conf, box, acon in detections:
-        if cls not in DRAW_CLASSES:
+        if cls not in cfg["classes"]["draw"]:
             continue
         x1, y1, x2, y2 = box
         color = COLORS.get(cls, (180, 180, 180))
         ax, ay = anchor_point(box)
-        zone = which_zone((ax, ay), ZONES)
+        zone = which_zone((ax, ay), cfg["zones"])
         inside = zone is not None
 
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        label = f"{CLASS_NAMES.get(cls, cls)} {conf:.2f}"
-        if cls in TARGET_CLASSES:
+        label = f"{cfg["classes"]["names"].get(cls, cls)} {conf:.2f}"
+        if cls in cfg["classes"]["target"]:
             label += f" | animal {acon:.2f}"
         if inside and zone != "frame":
             label += f" @{zone}"
@@ -420,7 +374,7 @@ def draw_overlay(frame, detections, infer_ms, armed_streak, triggered):
         cv2.circle(out, (ax, ay), 5, (0, 255, 0) if inside else (0, 0, 255), -1)
         cv2.circle(out, (ax, ay), 6, (0, 0, 0), 1)
 
-    hud = f"{infer_ms:5.1f}ms  streak {armed_streak}/{HISTORY_HITS}"
+    hud = f"{infer_ms:5.1f}ms  streak {armed_streak}/{cfg["history"]["hits"]}"
     cv2.rectangle(out, (0, 0), (230, 22), (0, 0, 0), -1)
     cv2.putText(out, hud, (6, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                 (0, 255, 0) if triggered else (220, 220, 220), 1)
@@ -433,27 +387,27 @@ def draw_overlay(frame, detections, infer_ms, armed_streak, triggered):
 
 
 def main():
-    print(f"[init] loading {MODEL_PATH}")
-    det = Detector(MODEL_PATH, IMGSZ)
+    print(f"[init] loading {cfg["model"]["path"]}")
+    det = Detector(cfg["model"]["path"], cfg["model"]["imgsz"])
 
     print(f"[init] opening stream")
-    cam = FreshestFrame(RTSP_URL)
+    cam = FreshestFrame(cfg["rtsp_url"])
 
     while cam.read() is None:
         time.sleep(0.2)
     print("[init] first frame received")
 
     web = None
-    if WEB_PORT:
-        web = WebView(port=WEB_PORT, zones=ZONES, quality=WEB_QUALITY)
+    if cfg["ui"]["web_port"]:
+        web = WebView(port=cfg["ui"]["web_port"], zones=cfg["zones"], quality=cfg["ui"]["web_quality"])
 
-    if SHOW_WINDOW:
+    if cfg["ui"]["show_window"]:
         cv2.namedWindow("catcam", cv2.WINDOW_NORMAL)
         cv2.setMouseCallback("catcam", on_mouse)
 
-    history = deque(maxlen=HISTORY_LEN)
+    history = deque(maxlen=cfg["history"]["len"])
     last_alert: dict[str | None, float] = {}
-    interval = 1.0 / INFER_FPS
+    interval = 1.0 / cfg["model"]["infer_fps"]
     paused = False
 
     try:
@@ -466,15 +420,15 @@ def main():
 
             if not paused:
                 t0 = time.time()
-                dets = det(frame, ROI)
+                dets = det(frame, roi)
                 infer_ms = (time.time() - t0) * 1000
 
                 zone_hits = []
                 hit_zone = None
                 for d in dets:
-                    if d[0] not in TARGET_CLASSES:
+                    if d[0] not in cfg["classes"]["target"]:
                         continue
-                    z = which_zone(anchor_point(d[2]), ZONES)
+                    z = which_zone(anchor_point(d[2]), cfg["zones"])
                     if z is not None:
                         zone_hits.append(d)
                         hit_zone = hit_zone or z
@@ -482,9 +436,9 @@ def main():
                 history.append(bool(zone_hits))
                 streak = sum(history)
 
-                triggered = streak >= HISTORY_HITS and bool(zone_hits)
+                triggered = streak >= cfg["history"]["hits"] and bool(zone_hits)
                 now = time.time()
-                if triggered and (now - last_alert.get(hit_zone, 0.0)) > ALERT_COOLDOWN:
+                if triggered and (now - last_alert.get(hit_zone, 0.0)) > cfg["alert"]["cooldown"]:
                     last_alert[hit_zone] = now
                     threading.Thread(
                         target=fire_alert,
@@ -500,43 +454,43 @@ def main():
                 web.set_status(
                     detections=[
                         {
-                            "cls": CLASS_NAMES.get(c, str(c)),
+                            "cls": cfg["classes"]["names"].get(c, str(c)),
                             "conf": round(p, 3),
                             "animal": round(a, 3),
-                            "zone": which_zone(anchor_point(b), ZONES),
-                            "target": c in TARGET_CLASSES,
+                            "zone": which_zone(anchor_point(b), cfg["zones"]),
+                            "target": c in cfg["classes"]["target"],
                             "box": list(b),
                         }
                         for c, p, b, a in dets
                     ],
                     infer_ms=round(infer_ms, 1),
                     streak=streak,
-                    need=HISTORY_HITS,
+                    need=cfg["history"]["hits"],
                     triggered=triggered,
-                    conf_thresh=CONF_THRESH,
+                    conf_thresh=cfg["model"]["conf_thresh"],
                 )
 
-            if SHOW_WINDOW:
+            if cfg["ui"]["show_window"]:
                 cv2.imshow("catcam", view)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
                 elif key == ord("s"):
-                    SNAPSHOT_DIR.mkdir(exist_ok=True)
-                    p = SNAPSHOT_DIR / f"manual-{time.strftime('%Y%m%d-%H%M%S')}.jpg"
+                    Path(cfg["alert"]["snapshot_dir"]).mkdir(exist_ok=True)
+                    p = Path(cfg["alert"]["snapshot_dir"]) / f"manual-{time.strftime('%Y%m%d-%H%M%S')}.jpg"
                     cv2.imwrite(str(p), view)
                     print(f"[snap] {p}")
                 elif key == ord("n"):
                     if len(clicked_points) < 3:
                         print("[zone] need at least 3 points")
                     else:
-                        name = input("zone name: ").strip() or f"zone{len(ZONES) + 1}"
-                        ZONES[name] = list(clicked_points)
+                        name = input("zone name: ").strip() or f"zone{len(cfg["zones"]) + 1}"
+                        cfg["zones"][name] = list(clicked_points)
                         clicked_points.clear()
-                        print(f"[zone] stored '{name}' ({len(ZONES[name])} pts)")
+                        print(f"[zone] stored '{name}' ({len(cfg["zones"][name])} pts)")
                 elif key == ord("z"):
                     print("\nZONES = {")
-                    for name, pts in ZONES.items():
+                    for name, pts in cfg["zones"].items():
                         print(f"    {name!r}: {pts},")
                     if clicked_points:
                         print(f"    # unsaved: {clicked_points}")
@@ -545,9 +499,9 @@ def main():
                     clicked_points.clear()
                     print("[zone] cleared pending points")
                 elif key == ord("x"):
-                    if ZONES:
-                        last = list(ZONES)[-1]
-                        del ZONES[last]
+                    if cfg["zones"]:
+                        last = list(cfg["zones"])[-1]
+                        del cfg["zones"][last]
                         print(f"[zone] removed '{last}'")
                 elif key == ord(" "):
                     paused = not paused
@@ -562,7 +516,7 @@ def main():
         if web is not None:
             web.stop()
         cam.stop()
-        if SHOW_WINDOW:
+        if cfg["ui"]["show_window"]:
             cv2.destroyAllWindows()
         print("[exit] stopped")
 

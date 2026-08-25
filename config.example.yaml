@@ -1,0 +1,94 @@
+# Copy this file to config.yaml and edit it for your setup:
+#   cp config.example.yaml config.yaml
+#
+# config.yaml is gitignored so local camera URLs, IPs, and zones stay private.
+
+rtsp_url: rtsp://user:password@192.168.1.100/stream1
+
+model:
+  path: best.onnx
+  imgsz: 640
+  # Intra-op threads
+  ort_threads: 4
+  conf_thresh: 0.50
+  iou_thresh: 0.60
+  infer_fps: 5.0
+
+audio:
+  # File must be in the same folder as the script
+  file: deterrent.wav
+  sonos_ip: 192.168.1.50
+  port: 8000
+  volume: 80          # 0-100
+  duration: 4.5       # length of the audio file in seconds
+
+dataset:
+  dir: dataset
+  enabled: true
+  min_interval: 4.0
+  negative_every: 90.0
+  label_thresh: 0.15
+  classes: [cat, dog, person]
+  # Map default YOLO/COCO class ids to dataset class indexes
+  coco_to_dataset:
+    15: 0  # cat
+    16: 1  # dog
+    0: 2   # person
+
+clips:
+  dir: clips
+  enabled: true
+  pre_seconds: 6.0      # buffered footage before the trigger
+  post_seconds: 12.0    # keep rolling after the last in-zone detection
+  max_seconds: 90.0     # hard stop, so a cat that naps doesn't fill the disk
+  fps: 6.0              # playback rate written into the file
+  scale: 0.5            # 1.0 = full res. 0.5 on 1080p is plenty for triage
+  overlay: true         # record the annotated view, not the raw frame
+
+# How the frame is cropped before inference.
+#   zones  - one crop per zone, sized from its polygon. Best detail; each
+#            counter is inspected at its own scale regardless of distance.
+#   fixed  - single crop from `fixed` below.
+#   none   - whole frame (worst detail on a wide-angle camera).
+roi:
+  mode: none
+  fixed: [0.0, 0.0, 1.0, 1.0]
+  # Padding around each zone's bounding box, as a fraction of its size.
+  pad_top: 1.20
+  pad_side: 0.15
+  pad_bottom: 0.15
+  # Smallest crop edge in pixels. Cropping tighter than the model's input
+  # just upscales blur, so don't go below this.
+  min_edge: 320
+  # true  - every zone every cycle (infer_fps applies per full sweep)
+  # false - one zone per cycle, round-robin (each zone gets infer_fps / n)
+  all_each_cycle: false
+
+classes:
+  names:
+    0: person
+    15: cat
+    16: dog
+  animal: [15, 16]
+  target: [15]         # what triggers an alert
+  draw: [0, 15, 16]    # what gets drawn in the debug view
+
+# Temporal filter: need `hits` detections within the last `len` inference frames.
+history:
+  len: 5
+  hits: 3
+
+alert:
+  cooldown: 30.0       # seconds between alerts
+  snapshot_dir: snapshots
+
+ui:
+  show_window: false   # local cv2 window; needs a display
+  web_port: 8080       # set to null to disable the MJPEG server
+  web_quality: 50      # JPEG quality; lower = less bandwidth
+
+# Active zones — a cat's anchor point inside ANY of these triggers.
+# Points are [x, y] in ORIGINAL frame coordinates, not letterboxed.
+# Empty mapping = whole frame active.
+# Draw these in the web UI, then paste the coordinates here.
+zones: {}

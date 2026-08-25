@@ -12,7 +12,7 @@ Keys (in debug window):
   space   : pause/unpause
 
 Workflow: click the outline of one counter, press 'n', type a name.
-Repeat for the next counter. Press 'z' and paste the output into ZONES.
+Repeat for the next counter. Press 'z' and paste the output into config.yaml.
 """
 
 import os
@@ -26,6 +26,7 @@ import http.server
 import subprocess
 from collections import deque
 from pathlib import Path
+import yaml
 import requests
 from datetime import datetime, timezone
 
@@ -39,106 +40,15 @@ import numpy as np
 import onnxruntime as ort
 from soco import SoCo
 
-from dotenv import dotenv_values
 from webview import WebView
 
-# ----------------------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------------------
+_cfg_path = Path(__file__).with_name("config.yaml")
+if not _cfg_path.exists():
+    _cfg_path.write_text(Path(__file__).with_name("config.example.yaml").read_text())
+    print("[init] created config.yaml from config.example.yaml")
+cfg = yaml.safe_load(_cfg_path.read_text())
+cfg.setdefault("zones", {})
 
-config = dotenv_values(".env")
-
-_BASE = os.environ.get("CATCAM_URL", "rtsp://camera:PASSWORD@192.168.5.207/")
-_STREAM = os.environ.get("CATCAM_STREAM", "stream1")
-RTSP_URL = _BASE.rstrip("/") + "/" + _STREAM
-MODEL_PATH = os.environ.get("CATCAM_MODEL", "best.onnx")
-IMGSZ = int(os.environ.get("CATCAM_IMGSZ", 640))
-
-AUDIO_FILE = "deterrent.wav" # File must be in the same folder as this script
-SONOS_IP = "192.168.5.183"    # Replace with your actual Sonos IP address
-AUDIO_PORT = 8000
-AUDIO_VOLUME = 80              # Deterrent volume level (0-100)
-AUDIO_DURATION = 4.5           # Length of your audio file in seconds
-
-# ---- Dataset capture -------------------------------------------------------
-DATASET_DIR = Path("dataset")
-CAPTURE_ENABLED = True
-
-CAPTURE_MIN_INTERVAL = 4.0
-CAPTURE_NEGATIVE_EVERY = 90.0
-CAPTURE_LABEL_THRESH = 0.15
-
-CLIP_DIR = Path("clips")
-CLIP_ENABLED = True
-
-CLIP_PRE_SECONDS = 6.0      # buffered footage before the trigger
-CLIP_POST_SECONDS = 12.0    # keep rolling after the last in-zone detection
-CLIP_MAX_SECONDS = 90.0     # hard stop, so a cat that naps doesn't fill the disk
-CLIP_FPS = 6.0              # playback rate written into the file
-CLIP_SCALE = 0.5            # 1.0 = full res. 0.5 on 1080p is plenty for triage
-CLIP_OVERLAY = True         # record the annotated view, not the raw frame
-
-# Class ids in YOUR dataset
-DATASET_CLASSES = ["cat", "dog", "person"]
-COCO_TO_DATASET = {0: 0, 1: 1, 2: 2}
-
-CONF_THRESH = 0.50
-IOU_THRESH = 0.60
-INFER_FPS = 5.0
-
-# How the frame is cropped before inference.
-#   "zones"  - one crop per zone, sized from its polygon. Best detail; each
-#              counter is inspected at its own scale regardless of distance.
-#   "fixed"  - single crop from ROI_FIXED below.
-#   "none"   - whole frame (worst detail on a wide-angle camera).
-ROI_MODE = "fixed"
-ROI_FIXED = (0.20, 0.22, 0.78, 1.00)
-
-# Padding around each zone's bounding box, as a fraction of its size..
-ROI_PAD_TOP = 1.20
-ROI_PAD_SIDE = 0.15
-ROI_PAD_BOTTOM = 0.15
-
-# Smallest crop edge in pixels. Cropping tighter than the model's input just
-# upscales blur, so don't go below this.
-ROI_MIN_EDGE = 320
-
-#   True  - every zone every cycle (INFER_FPS applies per full sweep)
-#   False - one zone per cycle, round-robin (each zone gets INFER_FPS / n)
-ROI_ALL_EACH_CYCLE = False
-
-# COCO class ids we care about.
-CLASS_NAMES = {0: "cat", 1: "dog", 2: "person"}
-ANIMAL_CLASSES = [0, 1]
-
-TARGET_CLASSES = {0}
-DRAW_CLASSES = {0, 1, 2}
-
-# Temporal filter: need N detections within the last M inference frames.
-HISTORY_LEN = 5
-HISTORY_HITS = 3
-
-ALERT_COOLDOWN = 30.0
-SNAPSHOT_DIR = Path("snapshots")
-
-# Active zones - a cat's anchor point inside ANY of these triggers.
-# Points are (x, y) in ORIGINAL frame coordinates, not letterboxed.
-# Empty list = whole frame active.
-# Build these interactively: click the outline, press 'n' to name and store,
-# repeat for the next counter, then press 'z' to print the whole block.
-ZONES = {
-    "island": [(818, 780),(1630, 809),(1374, 1161),(561, 972)],
-    # "counter": [(887, 571),(1919, 480),(1950, 756),(629, 718)],
-    "counter-lg": [(894, 564),(1920, 475),(1937, 622),(693, 676)],
-    "counter-sm": [(625, 715),(695, 672),(904, 666),(672, 815)]
-}
-
-SHOW_WINDOW = False
-WEB_PORT = 8080
-WEB_QUALITY = 50
-
-# Intra-op threads. Cap this - oversubscription hurts on a 4-core box.
-ORT_THREADS = 4
 
 def get_local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -167,7 +77,7 @@ def start_audio_server(port):
 class Detector:
     def __init__(self, model_path: str, imgsz: int = 640):
         so = ort.SessionOptions()
-        so.intra_op_num_threads = ORT_THREADS
+        so.intra_op_num_threads = cfg["model"]["ort_threads"]
         so.inter_op_num_threads = 1
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
@@ -244,7 +154,7 @@ class Detector:
 
         # Merge the animal classes into one score, so a cat split between
         # "cat" and "dog" isn't thresholded out of existence.
-        valid_animals = [c for c in ANIMAL_CLASSES if c < self.num_classes]
+        valid_animals = [c for c in cfg["classes"]["animal"] if c < self.num_classes]
         
         if valid_animals:
             animal_conf = scores_all[valid_animals].max(axis=0)
@@ -254,7 +164,7 @@ class Detector:
 
         conf_all = np.maximum(animal_conf, scores_all.max(axis=0))
 
-        keep = conf_all > CONF_THRESH
+        keep = conf_all > cfg["model"]["conf_thresh"]
         if not keep.any():
             return []
 
@@ -273,7 +183,7 @@ class Detector:
 
         rects = np.stack([x1, y1, x2 - x1, y2 - y1], axis=1)
         idxs = cv2.dnn.NMSBoxes(
-            rects.tolist(), conf.tolist(), CONF_THRESH, IOU_THRESH
+            rects.tolist(), conf.tolist(), cfg["model"]["conf_thresh"], cfg["model"]["iou_thresh"]
         )
         if len(idxs) == 0:
             return []
@@ -411,14 +321,14 @@ def zone_rois(zones, frame_shape):
         y1, y2 = min(ys), max(ys)
         bw, bh = x2 - x1, y2 - y1
 
-        x1 -= bw * ROI_PAD_SIDE
-        x2 += bw * ROI_PAD_SIDE
-        y1 -= bh * ROI_PAD_TOP
-        y2 += bh * ROI_PAD_BOTTOM
+        x1 -= bw * cfg["roi"]["pad_side"]
+        x2 += bw * cfg["roi"]["pad_side"]
+        y1 -= bh * cfg["roi"]["pad_top"]
+        y2 += bh * cfg["roi"]["pad_bottom"]
 
         # Enforce a minimum crop size, growing about the centre.
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-        cw, chh = max(x2 - x1, ROI_MIN_EDGE), max(y2 - y1, ROI_MIN_EDGE)
+        cw, chh = max(x2 - x1, cfg["roi"]["min_edge"]), max(y2 - y1, cfg["roi"]["min_edge"])
         x1, x2 = cx - cw / 2, cx + cw / 2
         y1, y2 = cy - chh / 2, cy + chh / 2
 
@@ -440,7 +350,7 @@ def merge_detections(groups, iou_thresh=0.55):
 
     boxes = [[d[2][0], d[2][1], d[2][2] - d[2][0], d[2][3] - d[2][1]] for d in flat]
     scores = [d[1] for d in flat]
-    idxs = cv2.dnn.NMSBoxes(boxes, scores, CONF_THRESH, iou_thresh)
+    idxs = cv2.dnn.NMSBoxes(boxes, scores, cfg["model"]["conf_thresh"], iou_thresh)
     if len(idxs) == 0:
         return []
     return [flat[i] for i in np.array(idxs).flatten()]
@@ -529,17 +439,17 @@ class DatasetCapture:
         now = time.time()
         labeled = [
             d for d in detections
-            if d[1] >= CAPTURE_LABEL_THRESH 
-            and d[0] in COCO_TO_DATASET
-            and COCO_TO_DATASET[d[0]] < len(self.classes)
+            if d[1] >= cfg["dataset"]["label_thresh"] 
+            and d[0] in cfg["dataset"]["coco_to_dataset"]
+            and cfg["dataset"]["coco_to_dataset"][d[0]] < len(self.classes)
         ]
 
         if not force:
             if labeled:
-                if now - self.last_capture < CAPTURE_MIN_INTERVAL:
+                if now - self.last_capture < cfg["dataset"]["min_interval"]:
                     return None
             else:
-                if now - self.last_negative < CAPTURE_NEGATIVE_EVERY:
+                if now - self.last_negative < cfg["dataset"]["negative_every"]:
                     return None
 
         h, w = frame.shape[:2]
@@ -551,7 +461,7 @@ class DatasetCapture:
 
         lines = []
         for cls, conf, box, _ in labeled:
-            did = COCO_TO_DATASET[cls]
+            did = cfg["dataset"]["coco_to_dataset"][cls]
             x1, y1, x2, y2 = box
             cx = ((x1 + x2) / 2) / w
             cy = ((y1 + y2) / 2) / h
@@ -566,7 +476,7 @@ class DatasetCapture:
         (self.lbl_dir / f"{name}.txt").write_text("\n".join(lines) + ("\n" if lines else ""))
 
         max_conf = max((d[1] for d in labeled), default=0.0)
-        cls_names = "|".join(sorted({self.classes[COCO_TO_DATASET[d[0]]] for d in labeled}))
+        cls_names = "|".join(sorted({self.classes[cfg["dataset"]["coco_to_dataset"][d[0]]] for d in labeled}))
         with self.notes.open("a") as f:
             f.write(f"{name}.jpg,{len(lines)},{max_conf:.3f},{cls_names}\n")
 
@@ -588,7 +498,7 @@ class ClipRecorder:
     def __init__(self, root: Path):
         self.root = root
         root.mkdir(parents=True, exist_ok=True)
-        self.pre = deque(maxlen=max(1, int(CLIP_PRE_SECONDS * INFER_FPS) + 2))
+        self.pre = deque(maxlen=max(1, int(cfg["clips"]["pre_seconds"] * cfg["model"]["infer_fps"]) + 2))
         self.frames: list[np.ndarray] | None = None
         self.last_trigger = 0.0
         self.started = 0.0
@@ -598,8 +508,8 @@ class ClipRecorder:
 
     @staticmethod
     def _prep(frame):
-        if CLIP_SCALE != 1.0:
-            frame = cv2.resize(frame, None, fx=CLIP_SCALE, fy=CLIP_SCALE,
+        if cfg["clips"]["scale"] != 1.0:
+            frame = cv2.resize(frame, None, fx=cfg["clips"]["scale"], fy=cfg["clips"]["scale"],
                                interpolation=cv2.INTER_AREA)
         return frame
 
@@ -611,8 +521,8 @@ class ClipRecorder:
                 return
             self.frames.append(f)
             now = time.time()
-            over = now - self.started > CLIP_MAX_SECONDS
-            idle = now - self.last_trigger > CLIP_POST_SECONDS
+            over = now - self.started > cfg["clips"]["max_seconds"]
+            idle = now - self.last_trigger > cfg["clips"]["post_seconds"]
             if over or idle:
                 frames, zone, started = self.frames, self.zone, self.started
                 self.frames = None
@@ -646,14 +556,14 @@ class ClipRecorder:
         stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(started))
         path = self.root / f"{stamp}-{zone}.mp4"
         vw = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"),
-                             CLIP_FPS, (w, h))
+                             cfg["clips"]["fps"], (w, h))
         if not vw.isOpened():
             print(f"[clip] FAILED to open writer for {path}")
             return
         for f in frames:
             vw.write(f)
         vw.release()
-        secs = len(frames) / CLIP_FPS
+        secs = len(frames) / cfg["clips"]["fps"]
         print(f"[clip] saved {path} ({len(frames)} frames, {secs:.1f}s"
               + (", hit max length)" if truncated else ")"))
         
@@ -664,24 +574,24 @@ class ClipRecorder:
 
 def fire_alert(frame, detections, zone_name, audio_uri=None):
     names = ", ".join(
-        f"{CLASS_NAMES.get(c, c)} {p:.2f} (animal {a:.2f})"
+        f"{cfg["classes"]["names"].get(c, c)} {p:.2f} (animal {a:.2f})"
         for c, p, _, a in detections
     )
     print(f"[ALERT] {time.strftime('%H:%M:%S')} - {names} in '{zone_name}'")
 
-    SNAPSHOT_DIR.mkdir(exist_ok=True)
-    path = SNAPSHOT_DIR / f"{time.strftime('%Y%m%d-%H%M%S')}-{zone_name}.jpg"
+    Path(cfg["alert"]["snapshot_dir"]).mkdir(exist_ok=True)
+    path = Path(cfg["alert"]["snapshot_dir"]) / f"{time.strftime('%Y%m%d-%H%M%S')}-{zone_name}.jpg"
     cv2.imwrite(str(path), frame)
     print(f"[ALERT] saved {path}")
 
     if audio_uri:
         try:
-            print(f"[ALERT] Triggering Sonos at {SONOS_IP}...")
-            sonos = SoCo(SONOS_IP)
+            print(f"[ALERT] Triggering Sonos at {cfg["audio"]["sonos_ip"]}...")
+            sonos = SoCo(cfg["audio"]["sonos_ip"])
             original_volume = sonos.volume
-            sonos.volume = AUDIO_VOLUME
+            sonos.volume = cfg["audio"]["volume"]
             sonos.play_uri(audio_uri)
-            time.sleep(AUDIO_DURATION)
+            time.sleep(cfg["audio"]["duration"])
             sonos.volume = original_volume
         except Exception as e:
             print(f"[ALERT] Error communicating with Sonos: {e}")
@@ -725,16 +635,16 @@ def draw_overlay(frame, detections, infer_ms, armed_streak, triggered, rois=None
                           (int(r[0] * w), int(r[1] * h)),
                           (int(r[2] * w), int(r[3] * h)), (0, 255, 255), 1)
 
-    if ZONES:
+    if cfg["zones"]:
         shade = out.copy()
-        for i, (name, poly_pts) in enumerate(ZONES.items()):
+        for i, (name, poly_pts) in enumerate(cfg["zones"].items()):
             if len(poly_pts) < 3:
                 continue
             poly = np.array(poly_pts, dtype=np.int32)
             cv2.fillPoly(shade, [poly], ZONE_COLORS[i % len(ZONE_COLORS)])
         cv2.addWeighted(shade, 0.22, out, 0.78, 0, out)
 
-        for i, (name, poly_pts) in enumerate(ZONES.items()):
+        for i, (name, poly_pts) in enumerate(cfg["zones"].items()):
             if len(poly_pts) < 3:
                 continue
             poly = np.array(poly_pts, dtype=np.int32)
@@ -754,17 +664,17 @@ def draw_overlay(frame, detections, infer_ms, armed_streak, triggered, rois=None
                           False, (255, 0, 255), 1)
 
     for cls, conf, box, acon in detections:
-        if cls not in DRAW_CLASSES:
+        if cls not in cfg["classes"]["draw"]:
             continue
         x1, y1, x2, y2 = box
         color = COLORS.get(cls, (180, 180, 180))
         ax, ay = anchor_point(box)
-        zone = which_zone((ax, ay), ZONES)
+        zone = which_zone((ax, ay), cfg["zones"])
         inside = zone is not None
 
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        label = f"{CLASS_NAMES.get(cls, cls)} {conf:.2f}"
-        if cls in TARGET_CLASSES:
+        label = f"{cfg["classes"]["names"].get(cls, cls)} {conf:.2f}"
+        if cls in cfg["classes"]["target"]:
             label += f" | animal {acon:.2f}"
         if inside and zone != "frame":
             label += f" @{zone}"
@@ -777,7 +687,7 @@ def draw_overlay(frame, detections, infer_ms, armed_streak, triggered, rois=None
         cv2.circle(out, (ax, ay), 5, (0, 255, 0) if inside else (0, 0, 255), -1)
         cv2.circle(out, (ax, ay), 6, (0, 0, 0), 1)
 
-    hud = f"{infer_ms:5.1f}ms  streak {armed_streak}/{HISTORY_HITS}"
+    hud = f"{infer_ms:5.1f}ms  streak {armed_streak}/{cfg["history"]["hits"]}"
     cv2.rectangle(out, (0, 0), (230, 22), (0, 0, 0), -1)
     cv2.putText(out, hud, (6, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                 (0, 255, 0) if triggered else (220, 220, 220), 1)
@@ -794,16 +704,16 @@ def _mask_url(u: str) -> str:
 
 
 def main():
-    print(f"[init] loading {MODEL_PATH}")
-    det = Detector(MODEL_PATH, IMGSZ)
+    print(f"[init] loading {cfg["model"]["path"]}")
+    det = Detector(cfg["model"]["path"], cfg["model"]["imgsz"])
 
-    print(f"[init] url: {_mask_url(RTSP_URL)}")
-    cam = FreshestFrame(RTSP_URL)
+    print(f"[init] url: {_mask_url(cfg["rtsp_url"])}")
+    cam = FreshestFrame(cfg["rtsp_url"])
     
     local_ip = get_local_ip()
-    print(f"[init] Starting audio server on {local_ip}:{AUDIO_PORT}")
-    audio_server = start_audio_server(AUDIO_PORT)
-    audio_uri = f"http://{local_ip}:{AUDIO_PORT}/{AUDIO_FILE}"
+    print(f"[init] Starting audio server on {local_ip}:{cfg["audio"]["port"]}")
+    audio_server = start_audio_server(cfg["audio"]["port"])
+    audio_uri = f"http://{local_ip}:{cfg["audio"]["port"]}/{cfg["audio"]["file"]}"
     print(f"[init] Sonos deterrent URI configured as: {audio_uri}")
 
     while cam.read() is None:
@@ -816,25 +726,25 @@ def main():
               "main stream, and that nothing else holds the camera's "
               "main-stream slot.")
 
-    for _zname, _zpoly in list(ZONES.items()):
+    for _zname, _zpoly in list(cfg["zones"].items()):
         if len(_zpoly) >= 3:
             fixed = order_polygon(_zpoly)
             if fixed != list(_zpoly):
-                ZONES[_zname] = fixed
+                cfg["zones"][_zname] = fixed
                 print(f"[zones] reordered '{_zname}' to remove self-intersection")
 
-    check_zone_scale(ZONES, _f0.shape)
+    check_zone_scale(cfg["zones"], _f0.shape)
 
     capture = None
-    if CAPTURE_ENABLED:
-        capture = DatasetCapture(DATASET_DIR, DATASET_CLASSES)
+    if cfg["dataset"]["enabled"]:
+        capture = DatasetCapture(Path(cfg["dataset"]["dir"]), cfg["dataset"]["classes"])
         
-    clips = ClipRecorder(CLIP_DIR) if CLIP_ENABLED else None
+    clips = ClipRecorder(Path(cfg["clips"]["dir"])) if cfg["clips"]["enabled"] else None
 
     latest_for_capture = {"frame": None, "dets": []}
 
     web = None
-    if WEB_PORT:
+    if cfg["ui"]["web_port"]:
         def _do_capture(tag):
             f = latest_for_capture["frame"]
             if f is None or capture is None:
@@ -842,18 +752,18 @@ def main():
             return capture.maybe_capture(
                 f, latest_for_capture["dets"], force=True, tag=tag)
 
-        web = WebView(port=WEB_PORT, zones=ZONES, quality=WEB_QUALITY,
+        web = WebView(port=cfg["ui"]["web_port"], zones=cfg["zones"], quality=cfg["ui"]["web_quality"],
                       on_capture=_do_capture, order_points=order_polygon)
 
-    if SHOW_WINDOW:
+    if cfg["ui"]["show_window"]:
         cv2.namedWindow("catcam", cv2.WINDOW_NORMAL)
         cv2.setMouseCallback("catcam", on_mouse)
 
-    history = deque(maxlen=HISTORY_LEN)
+    history = deque(maxlen=cfg["history"]["len"])
     rr_index = 0
     last_rois = [None]
     last_alert: dict[str | None, float] = {}
-    interval = 1.0 / INFER_FPS
+    interval = 1.0 / cfg["model"]["infer_fps"]
     paused = False
 
     try:
@@ -867,11 +777,11 @@ def main():
             if not paused:
                 t0 = time.time()
 
-                if ROI_MODE == "zones":
-                    rois = zone_rois(ZONES, frame.shape)
-                    current_roi_count = len(rois) if not ROI_ALL_EACH_CYCLE else 1
+                if cfg["roi"]["mode"] == "zones":
+                    rois = zone_rois(cfg["zones"], frame.shape)
+                    current_roi_count = len(rois) if not cfg["roi"]["all_each_cycle"] else 1
                     
-                    if ROI_ALL_EACH_CYCLE or len(rois) == 1:
+                    if cfg["roi"]["all_each_cycle"] or len(rois) == 1:
                         active = rois
                     else:
                         active = [rois[rr_index % len(rois)]]
@@ -880,10 +790,10 @@ def main():
                     dets = merge_detections([det(frame, r) for _, r in active])
                     last_rois = [r for _, r in active]
                     
-                elif ROI_MODE == "fixed":
+                elif cfg["roi"]["mode"] == "fixed":
                     current_roi_count = 1
-                    dets = det(frame, ROI_FIXED)
-                    last_rois = [ROI_FIXED]
+                    dets = det(frame, cfg["roi"]["fixed"])
+                    last_rois = [cfg["roi"]["fixed"]]
                     
                 else:
                     current_roi_count = 1
@@ -892,7 +802,7 @@ def main():
 
                 infer_ms = (time.time() - t0) * 1000
 
-                dynamic_history_len = HISTORY_LEN * current_roi_count
+                dynamic_history_len = cfg["history"]["len"] * current_roi_count
                 if history.maxlen != dynamic_history_len:
                     history = deque(history, maxlen=dynamic_history_len)
                     
@@ -905,9 +815,9 @@ def main():
                     if d[0] == 2:
                         person_detected = True
                         
-                    if d[0] not in TARGET_CLASSES:
+                    if d[0] not in cfg["classes"]["target"]:
                         continue
-                    z = which_zone(anchor_point(d[2]), ZONES)
+                    z = which_zone(anchor_point(d[2]), cfg["zones"])
                     if z is not None:
                         zone_hits.append(d)
                         hit_zone = hit_zone or z
@@ -924,12 +834,12 @@ def main():
                     latest_for_capture["dets"] = dets
                     capture.maybe_capture(frame, dets)
 
-                triggered = streak >= HISTORY_HITS and bool(zone_hits)
+                triggered = streak >= cfg["history"]["hits"] and bool(zone_hits)
                 now = time.time()
 
                 if triggered and clips is not None:
                     clips.trigger(hit_zone)
-                if triggered and (now - last_alert.get(hit_zone, 0.0)) > ALERT_COOLDOWN:
+                if triggered and (now - last_alert.get(hit_zone, 0.0)) > cfg["alert"]["cooldown"]:
                     last_alert[hit_zone] = now
                     threading.Thread(
                         target=fire_alert,
@@ -946,50 +856,50 @@ def main():
             view = draw_overlay(frame, dets, infer_ms, streak, triggered, last_rois)
             
             if clips is not None:
-                clips.push(view if CLIP_OVERLAY else frame)
+                clips.push(view if cfg["clips"]["overlay"] else frame)
 
             if web is not None:
                 web.publish(view)
                 web.set_status(
                     detections=[
                         {
-                            "cls": CLASS_NAMES.get(c, str(c)),
+                            "cls": cfg["classes"]["names"].get(c, str(c)),
                             "conf": round(p, 3),
                             "animal": round(a, 3),
-                            "zone": which_zone(anchor_point(b), ZONES),
-                            "target": c in TARGET_CLASSES,
+                            "zone": which_zone(anchor_point(b), cfg["zones"]),
+                            "target": c in cfg["classes"]["target"],
                             "box": list(b),
                         }
                         for c, p, b, a in dets
                     ],
                     infer_ms=round(infer_ms, 1),
                     streak=streak,
-                    need=HISTORY_HITS,
+                    need=cfg["history"]["hits"],
                     triggered=triggered,
-                    conf_thresh=CONF_THRESH,
+                    conf_thresh=cfg["model"]["conf_thresh"],
                 )
 
-            if SHOW_WINDOW:
+            if cfg["ui"]["show_window"]:
                 cv2.imshow("catcam", view)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (ord("q"), 27):
                     break
                 elif key == ord("s"):
-                    SNAPSHOT_DIR.mkdir(exist_ok=True)
-                    p = SNAPSHOT_DIR / f"manual-{time.strftime('%Y%m%d-%H%M%S')}.jpg"
+                    Path(cfg["alert"]["snapshot_dir"]).mkdir(exist_ok=True)
+                    p = Path(cfg["alert"]["snapshot_dir"]) / f"manual-{time.strftime('%Y%m%d-%H%M%S')}.jpg"
                     cv2.imwrite(str(p), view)
                     print(f"[snap] {p}")
                 elif key == ord("n"):
                     if len(clicked_points) < 3:
                         print("[zone] need at least 3 points")
                     else:
-                        name = input("zone name: ").strip() or f"zone{len(ZONES) + 1}"
-                        ZONES[name] = list(clicked_points)
+                        name = input("zone name: ").strip() or f"zone{len(cfg["zones"]) + 1}"
+                        cfg["zones"][name] = list(clicked_points)
                         clicked_points.clear()
-                        print(f"[zone] stored '{name}' ({len(ZONES[name])} pts)")
+                        print(f"[zone] stored '{name}' ({len(cfg["zones"][name])} pts)")
                 elif key == ord("z"):
                     print("\nZONES = {")
-                    for name, pts in ZONES.items():
+                    for name, pts in cfg["zones"].items():
                         print(f"    {name!r}: {pts},")
                     if clicked_points:
                         print(f"    # unsaved: {clicked_points}")
@@ -998,9 +908,9 @@ def main():
                     clicked_points.clear()
                     print("[zone] cleared pending points")
                 elif key == ord("x"):
-                    if ZONES:
-                        last = list(ZONES)[-1]
-                        del ZONES[last]
+                    if cfg["zones"]:
+                        last = list(cfg["zones"])[-1]
+                        del cfg["zones"][last]
                         print(f"[zone] removed '{last}'")
                 elif key == ord(" "):
                     paused = not paused
@@ -1019,7 +929,7 @@ def main():
             clips.flush()
             
         cam.stop()
-        if SHOW_WINDOW:
+        if cfg["ui"]["show_window"]:
             cv2.destroyAllWindows()
         print("[exit] stopped")
 

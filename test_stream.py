@@ -1,8 +1,14 @@
-import os, time, cv2
+import os, time, cv2, yaml
+from pathlib import Path
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
     "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|reorder_queue_size;0"
 )
-URL = "rtsp://camera:Op200143@192.168.5.207:554/stream2"
+_cfg_path = Path(__file__).with_name("config.yaml")
+if not _cfg_path.exists():
+    _cfg_path.write_text(Path(__file__).with_name("config.example.yaml").read_text())
+    print("[init] created config.yaml from config.example.yaml")
+cfg = yaml.safe_load(_cfg_path.read_text())
+URL = cfg["rtsp_url"]
 cap = cv2.VideoCapture(URL, cv2.CAP_FFMPEG)
 print("opened:", cap.isOpened())
 t = time.time(); n = 0

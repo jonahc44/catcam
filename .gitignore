@@ -8,3 +8,4 @@ __pycache__
 *.pt
 *.onnx
 .venv
+config.yaml

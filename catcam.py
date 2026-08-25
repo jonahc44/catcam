@@ -574,7 +574,7 @@ class ClipRecorder:
 
 def fire_alert(frame, detections, zone_name, audio_uri=None):
     names = ", ".join(
-        f"{cfg["classes"]["names"].get(c, c)} {p:.2f} (animal {a:.2f})"
+        f"{cfg['classes']['names'].get(c, c)} {p:.2f} (animal {a:.2f})"
         for c, p, _, a in detections
     )
     print(f"[ALERT] {time.strftime('%H:%M:%S')} - {names} in '{zone_name}'")
@@ -586,7 +586,7 @@ def fire_alert(frame, detections, zone_name, audio_uri=None):
 
     if audio_uri:
         try:
-            print(f"[ALERT] Triggering Sonos at {cfg["audio"]["sonos_ip"]}...")
+            print(f"[ALERT] Triggering Sonos at {cfg['audio']['sonos_ip']}...")
             sonos = SoCo(cfg["audio"]["sonos_ip"])
             original_volume = sonos.volume
             sonos.volume = cfg["audio"]["volume"]
@@ -673,7 +673,7 @@ def draw_overlay(frame, detections, infer_ms, armed_streak, triggered, rois=None
         inside = zone is not None
 
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-        label = f"{cfg["classes"]["names"].get(cls, cls)} {conf:.2f}"
+        label = f"{cfg['classes']['names'].get(cls, cls)} {conf:.2f}"
         if cls in cfg["classes"]["target"]:
             label += f" | animal {acon:.2f}"
         if inside and zone != "frame":
@@ -687,7 +687,7 @@ def draw_overlay(frame, detections, infer_ms, armed_streak, triggered, rois=None
         cv2.circle(out, (ax, ay), 5, (0, 255, 0) if inside else (0, 0, 255), -1)
         cv2.circle(out, (ax, ay), 6, (0, 0, 0), 1)
 
-    hud = f"{infer_ms:5.1f}ms  streak {armed_streak}/{cfg["history"]["hits"]}"
+    hud = f"{infer_ms:5.1f}ms  streak {armed_streak}/{cfg['history']['hits']}"
     cv2.rectangle(out, (0, 0), (230, 22), (0, 0, 0), -1)
     cv2.putText(out, hud, (6, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                 (0, 255, 0) if triggered else (220, 220, 220), 1)
@@ -704,18 +704,18 @@ def _mask_url(u: str) -> str:
 
 
 def main():
-    print(f"[init] loading {cfg["model"]["path"]}")
+    print(f"[init] loading {cfg['model']['path']}")
     det = Detector(cfg["model"]["path"], cfg["model"]["imgsz"])
 
-    print(f"[init] url: {_mask_url(cfg["rtsp_url"])}")
+    print(f"[init] url: {_mask_url(cfg['rtsp_url'])}")
     cam = FreshestFrame(cfg["rtsp_url"])
     
     audio_uri = None
     if cfg["audio"]["enabled"]:
         local_ip = get_local_ip()
-        print(f"[init] Starting audio server on {local_ip}:{cfg["audio"]["port"]}")
+        print(f"[init] Starting audio server on {local_ip}:{cfg['audio']['port']}")
         start_audio_server(cfg["audio"]["port"])
-        audio_uri = f"http://{local_ip}:{cfg["audio"]["port"]}/{cfg["audio"]["file"]}"
+        audio_uri = f"http://{local_ip}:{cfg['audio']['port']}/{cfg['audio']['file']}"
         print(f"[init] Sonos deterrent URI configured as: {audio_uri}")
     else:
         print("[init] Sonos deterrent disabled")
@@ -897,10 +897,10 @@ def main():
                     if len(clicked_points) < 3:
                         print("[zone] need at least 3 points")
                     else:
-                        name = input("zone name: ").strip() or f"zone{len(cfg["zones"]) + 1}"
+                        name = input("zone name: ").strip() or f"zone{len(cfg['zones']) + 1}"
                         cfg["zones"][name] = list(clicked_points)
                         clicked_points.clear()
-                        print(f"[zone] stored '{name}' ({len(cfg["zones"][name])} pts)")
+                        print(f"[zone] stored '{name}' ({len(cfg['zones'][name])} pts)")
                 elif key == ord("z"):
                     print("\nZONES = {")
                     for name, pts in cfg["zones"].items():
